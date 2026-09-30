@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Smart Road Assistant (All-in-One)</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <style>
+    body { margin: 0; font-family: Arial, sans-serif; }
+    #map { height: 80vh; }
+    #panel {
+      padding: 10px;
+      background: #f5f5f5;
+      border-top: 1px solid #ccc;
+    }
+    #panel span { margin-right: 20px; }
+    .alert { color: red; font-weight: bold; }
+    .ok { color: green; }
+  </style>
+</head>
+<body>
+
+<div id="map"></div>
+
+<div id="panel">
+  <span><strong>Speed:</strong> <span id="speed">0</span> km/h</span>
+  <span><strong>Speed limit:</strong> <span id="limit">50</span> km/h</span>
+  <span id="status" class="ok">Waiting for GPS...</span>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+  const speedEl = document.getElementById('speed');
+  const limitEl = document.getElementById('limit');
+  const statusEl = document.getElementById('status');
+
+  let speedLimit = 50;
+  limitEl.textContent = speedLimit;
+
+  const map = L.map('map').setView([46.31, -79.46], 14);
+
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxZoom: 19,
+    attribution: '&copy; OpenStreetMap'
+  }).addTo(map);
+
+  const userMarker = L.circleMarker([0, 0], {
+    radius: 8,
+    color: 'blue',
+    fillColor: 'blue',
+    fillOpacity: 0.8
+  }).addTo(map);
+
+  let lastPos = null;
+  let lastTime = null;
+  let currentLat = null;
+  let currentLon = null;
+
+  let stopMarkers = [];
+  let signalMarkers = [];
+  let onewayWays = [];
+
+  function distanceInMeters(lat1, lon1, lat2, lon2) {
+    const R = 6371000;
+    const toRad = x => x * Math.PI / 180;
+    const dLat = toRad(lat2 - lat1);
+    const dLon = toRad(lon2 - lon1);
+    const a =
+      Math.sin(dLat / 2) ** 2 +
+      Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) *
+      Math.sin(dLon / 2) ** 2;
+    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+    return R * c;
+  }
+
+  function speak(text) {
+    const msg = new SpeechSynthesisUtterance(text);
+    msg.rate = 1.1;
+    window.speechSynthesis.speak(msg);
+  }
+
+  function clearMarkers() {
+    stopMarkers.forEach(m => map.removeLayer(m));
+    signalMarkers.forEach(m => map.removeLayer(m));
+    stopMarkers = [];
+    signalMarkers = [];
+  }
+
+  function addStopMarker(lat, lon, tags) {
+    const type = tags.stop === 'all' ? 'All-way stop' : 'Stop';
+    const marker = L.circleMarker([lat, lon], {
+      radius: 6,
+      color: 'red',
+      fillColor: 'red',
+      fillOpacity: 0.8
+    }).addTo(map).bindPopup(type);
+    stopMarkers.push(marker);
+  }
+
+  function addSignalMarker(lat, lon) {
+    const marker = L.circleMarker([lat, lon], {
+      radius: 6,
+      color: 'orange',
+      fillColor: 'orange',
+      fillOpacity: 0.8
+    }).addTo(map).bindPopup('Traffic signal');
+    signalMarkers.push(marker);
+  }
+
+  function checkStopsAndSignalsAhead(lat, lon) {
+    const ALERT_DISTANCE = 100;
+
+    stopMarkers.forEach(m => {
+      const pos = m.getLatLng();
+      const d = distanceInMeters(lat, lon, pos.lat, pos.lng);
+      if (d <= ALERT_DISTANCE) {
+        statusEl.textContent = `⚠️ Stop ahead in ${Math.round(d)} m`;
+        statusEl.className = 'alert';
+        speak(`Stop ahead in ${Math.round(d)} meters`);
+      }
+    });
+
+    signalMarkers.forEach(m => {
+      const pos = m.getLatLng();
+      const d = distanceInMeters(lat, lon, pos.lat, pos.lng);
+      if (d <= ALERT_DISTANCE) {
+        statusEl.textContent = `⚠️ Signal ahead in ${Math.round(d)} m`;
+        statusEl.className = 'alert';
+        speak(`Signal ahead in ${Math.round(d)} meters`);
+      }
+    });
+  }
+
+  function updateSpeed(position) {
+    const { latitude, longitude, accuracy } = position.coords;
+    const now = Date.now();
+
+    currentLat = latitude;
+    currentLon = longitude;
+
+    userMarker.setLatLng([latitude, longitude]);
+    map.panTo([latitude, longitude]);
+
+    if (accuracy > 50) {
+      statusEl.textContent = `⚠️ Low GPS accuracy (${Math.round(accuracy)}m).`;
+      statusEl.className = 'alert';
+    }
+
+    if (lastPos && lastTime) {
+      const dist = distanceInMeters(lastPos.latitude, lastPos.longitude, latitude, longitude);
+      const timeDiffSec = (now - lastTime) / 1000;
+      const speedMs = dist / timeDiffSec;
+      const speedKmh = speedMs * 3.6;
+
+      if (!isFinite(speedKmh)) return;
+
+      speedEl.textContent = speedKmh.toFixed(1);
+
+      if (speedKmh > speedLimit + 2) {
+        statusEl.textContent = '⚠️ Speed limit exceeded!';
+        statusEl.className = 'alert';
+        speak('You are exceeding the speed limit');
+      } else {
+        statusEl.textContent = '✅ Within speed limit.';
+        statusEl.className = 'ok';
+      }
+
+      checkStopsAndSignalsAhead(latitude, longitude);
+    }
+
+    lastPos = { latitude, longitude };
+    lastTime = now;
+  }
+
+  function handleError(err) {
+    statusEl.textContent = 'GPS error: ' + err.message;
+    statusEl.className = 'alert';
+  }
+
+  navigator.geolocation.watchPosition(updateSpeed, handleError, {
+    enableHighAccuracy: true,
+    maximumAge: 0,
+    timeout: 5000
+  });
+
+  async function fetchOSMFeatures(lat, lon) {
+    const radius = 400; // meters
+    const query = `
+      [out:json];
+      (
+        node["highway"="stop"](around:${radius},${lat},${lon});
+        node["highway"="traffic_signals"](around:${radius},${lat},${lon});
+        way["oneway"](around:${radius},${lat},${lon});
+      );
+      out body;
+      >;
+      out skel qt;
+    `;
+
+    const url = 'https://overpass-api.de/api/interpreter';
+
+    try {
+      const res = await fetch(url, {
+        method: 'POST',
+        body: query
+      });
+      const data = await res.json();
+      processOSMData(data);
+    } catch (e) {
+      console.error(e);
+    }
+  }
+
+  function processOSMData(data) {
+    clearMarkers();
+    onewayWays = [];
+
+    const nodes = {};
+    data.elements.forEach(el => {
+      if (el.type === 'node') {
+        nodes[el.id] = el;
+      }
+    });
+
+    data.elements.forEach(el => {
+      if (el.type === 'node' && el.tags) {
+        if (el.tags.highway === 'stop') {
+          addStopMarker(el.lat, el.lon, el.tags);
+        }
+        if (el.tags.highway === 'traffic_signals') {
+          addSignalMarker(el.lat, el.lon);
+        }
+      }
+      if (el.type === 'way' && el.tags && el.tags.oneway) {
+        onewayWays.push(el);
+      }
+    });
+  }
+
+  function fakeZoneAndSpeed(lat, lon) {
+    // Simple demo: treat a small area as "school zone"
+    const schoolCenter = { lat: 46.3150, lon: -79.4550 };
+    const dSchool = distanceInMeters(lat, lon, schoolCenter.lat, schoolCenter.lon);
+
+    if (dSchool < 300) {
+      return { zone: 'school', speedLimit: 40 };
+    }
+    // Else treat as city
+    return { zone: 'city', speedLimit: 50 };
+  }
+
+  function refreshZoneAndOSM() {
+    if (!currentLat || !currentLon) return;
+
+    const zoneData = fakeZoneAndSpeed(currentLat, currentLon);
+    speedLimit = zoneData.speedLimit;
+    limitEl.textContent = speedLimit;
+
+    if (zoneData.zone === 'school') {
+      statusEl.textContent = 'School zone. Drive carefully.';
+      statusEl.className = 'alert';
+      speak('School zone. Drive carefully.');
+    }
+
+    fetchOSMFeatures(currentLat, currentLon);
+  }
+
+  setInterval(refreshZoneAndOSM, 5000);
+</script>
+
+</body>
+</html>
