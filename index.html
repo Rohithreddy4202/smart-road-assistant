@@ -2,19 +2,15 @@
 <html>
 <head>
   <meta charset="utf-8" />
-  <title>Smart Road Assistant (All-in-One)</title>
+  <title>Smart Road Assistant</title>
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
   <style>
-    body { margin: 0; font-family: Arial, sans-serif; }
-    #map { height: 80vh; }
-    #panel {
-      padding: 10px;
-      background: #f5f5f5;
-      border-top: 1px solid #ccc;
-    }
+    body { margin: 0; font-family: Arial; }
+    #map { height: 70vh; }
+    #panel { padding: 10px; background: #f5f5f5; border-top: 1px solid #ccc; }
     #panel span { margin-right: 20px; }
-    .alert { color: red; font-weight: bold; }
-    .ok { color: green; }
+    #destBox { width: 300px; padding: 5px; }
+    #results button { width: 100%; padding: 8px; margin-bottom: 5px; text-align: left; }
   </style>
 </head>
 <body>
@@ -22,13 +18,57 @@
 <div id="map"></div>
 
 <div id="panel">
+  <input id="destBox" placeholder="Enter destination (address or lat,lon)" />
+  <button onclick="setDestination()">Go</button>
+  <br><br>
   <span><strong>Speed:</strong> <span id="speed">0</span> km/h</span>
   <span><strong>Speed limit:</strong> <span id="limit">50</span> km/h</span>
-  <span id="status" class="ok">Waiting for GPS...</span>
+  <span id="status">Waiting for GPS...</span>
 </div>
+
+<div id="results" style="padding:10px;"></div>
 
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script>
+
+  /* ------------------ CREATE MAP ------------------ */
+  const map = L.map('map', { zoomSnap: 0.25 }).setView([46.31, -79.46], 14);
+
+  L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxZoom: 19,
+    minZoom: 3,
+    attribution: '&copy; OpenStreetMap contributors'
+  }).addTo(map);
+
+  /* ------------------ ICONS ------------------ */
+  function makeIcon(url, size) {
+    return L.icon({ iconUrl: url, iconSize: [size, size] });
+  }
+
+  let stopIcon = makeIcon("https://cdn-icons-png.flaticon.com/512/565/565547.png", 30);
+  let allWayIcon = makeIcon("https://cdn-icons-png.flaticon.com/512/252/252025.png", 30);
+  let signalIcon = makeIcon("https://cdn-icons-png.flaticon.com/512/483/483947.png", 30);
+
+  let nodeLayer = L.layerGroup().addTo(map);
+
+  /* ------------------ AUTO RESIZE ICONS ON ZOOM ------------------ */
+  map.on("zoomend", () => {
+    const z = map.getZoom();
+    const size = z < 14 ? 20 : z < 17 ? 25 : 30;
+
+    stopIcon = makeIcon(stopIcon.options.iconUrl, size);
+    allWayIcon = makeIcon(allWayIcon.options.iconUrl, size);
+    signalIcon = makeIcon(signalIcon.options.iconUrl, size);
+
+    nodeLayer.eachLayer(layer => {
+      const type = layer.options.type;
+      if (type === "Stop") layer.setIcon(stopIcon);
+      if (type === "All-way stop") layer.setIcon(allWayIcon);
+      if (type === "Signal") layer.setIcon(signalIcon);
+    });
+  });
+
+  /* ------------------ UI ELEMENTS ------------------ */
   const speedEl = document.getElementById('speed');
   const limitEl = document.getElementById('limit');
   const statusEl = document.getElementById('status');
@@ -36,235 +76,251 @@
   let speedLimit = 50;
   limitEl.textContent = speedLimit;
 
-  const map = L.map('map').setView([46.31, -79.46], 14);
-
-  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-    maxZoom: 19,
-    attribution: '&copy; OpenStreetMap'
-  }).addTo(map);
-
   const userMarker = L.circleMarker([0, 0], {
-    radius: 8,
-    color: 'blue',
-    fillColor: 'blue',
-    fillOpacity: 0.8
+    radius: 8, color: 'blue', fillColor: 'blue', fillOpacity: 0.8
   }).addTo(map);
 
-  let lastPos = null;
-  let lastTime = null;
-  let currentLat = null;
-  let currentLon = null;
+  let lastPos = null, lastTime = null;
+  let currentLat = null, currentLon = null, currentHeading = null;
+  let routeCoords = [], routePolyline = null, routeSteps = [], nextStepIndex = 0;
+  let mapNodes = [], alerted = new Set();
 
-  let stopMarkers = [];
-  let signalMarkers = [];
-  let onewayWays = [];
-
-  function distanceInMeters(lat1, lon1, lat2, lon2) {
-    const R = 6371000;
-    const toRad = x => x * Math.PI / 180;
-    const dLat = toRad(lat2 - lat1);
-    const dLon = toRad(lon2 - lon1);
-    const a =
-      Math.sin(dLat / 2) ** 2 +
-      Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) *
-      Math.sin(dLon / 2) ** 2;
-    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-    return R * c;
-  }
-
+  /* ------------------ SPEAK ------------------ */
   function speak(text) {
     const msg = new SpeechSynthesisUtterance(text);
     msg.rate = 1.1;
     window.speechSynthesis.speak(msg);
   }
 
-  function clearMarkers() {
-    stopMarkers.forEach(m => map.removeLayer(m));
-    signalMarkers.forEach(m => map.removeLayer(m));
-    stopMarkers = [];
-    signalMarkers = [];
+  /* ------------------ DISTANCE + BEARING ------------------ */
+  function distance(lat1, lon1, lat2, lon2) {
+    const R = 6371000;
+    const toRad = x => x * Math.PI / 180;
+    const dLat = toRad(lat2 - lat1);
+    const dLon = toRad(lon2 - lon1);
+    const a = Math.sin(dLat/2)**2 +
+              Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) *
+              Math.sin(dLon/2)**2;
+    return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
   }
 
-  function addStopMarker(lat, lon, tags) {
-    const type = tags.stop === 'all' ? 'All-way stop' : 'Stop';
-    const marker = L.circleMarker([lat, lon], {
-      radius: 6,
-      color: 'red',
-      fillColor: 'red',
-      fillOpacity: 0.8
-    }).addTo(map).bindPopup(type);
-    stopMarkers.push(marker);
+  function bearing(lat1, lon1, lat2, lon2) {
+    const toRad = x => x * Math.PI / 180;
+    const toDeg = x => x * 180 / Math.PI;
+    const dLon = toRad(lon2 - lon1);
+    const y = Math.sin(dLon) * Math.cos(toRad(lat2));
+    const x = Math.cos(toRad(lat1)) * Math.sin(toRad(lat2)) -
+              Math.sin(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.cos(dLon);
+    return (toDeg(Math.atan2(y, x)) + 360) % 360;
   }
 
-  function addSignalMarker(lat, lon) {
-    const marker = L.circleMarker([lat, lon], {
-      radius: 6,
-      color: 'orange',
-      fillColor: 'orange',
-      fillOpacity: 0.8
-    }).addTo(map).bindPopup('Traffic signal');
-    signalMarkers.push(marker);
+  function isIncoming(lat, lon) {
+    if (!currentHeading) return true;
+    const br = bearing(currentLat, currentLon, lat, lon);
+    const diff = Math.abs(br - currentHeading);
+    return diff < 45 || diff > 315;
   }
 
-  function checkStopsAndSignalsAhead(lat, lon) {
-    const ALERT_DISTANCE = 100;
-
-    stopMarkers.forEach(m => {
-      const pos = m.getLatLng();
-      const d = distanceInMeters(lat, lon, pos.lat, pos.lng);
-      if (d <= ALERT_DISTANCE) {
-        statusEl.textContent = `⚠️ Stop ahead in ${Math.round(d)} m`;
-        statusEl.className = 'alert';
-        speak(`Stop ahead in ${Math.round(d)} meters`);
-      }
-    });
-
-    signalMarkers.forEach(m => {
-      const pos = m.getLatLng();
-      const d = distanceInMeters(lat, lon, pos.lat, pos.lng);
-      if (d <= ALERT_DISTANCE) {
-        statusEl.textContent = `⚠️ Signal ahead in ${Math.round(d)} m`;
-        statusEl.className = 'alert';
-        speak(`Signal ahead in ${Math.round(d)} meters`);
-      }
-    });
+  function isOnRoute(lat, lon) {
+    for (let i = 0; i < routeCoords.length; i++) {
+      const d = distance(lat, lon, routeCoords[i][1], routeCoords[i][0]);
+      if (d < 40) return true;
+    }
+    return false;
   }
 
-  function updateSpeed(position) {
-    const { latitude, longitude, accuracy } = position.coords;
+  /* ------------------ GPS UPDATE ------------------ */
+  function updateSpeed(pos) {
+    const { latitude, longitude, heading } = pos.coords;
     const now = Date.now();
-
-    currentLat = latitude;
-    currentLon = longitude;
-
+    currentLat = latitude; currentLon = longitude;
+    currentHeading = heading || currentHeading;
     userMarker.setLatLng([latitude, longitude]);
+    if (!routePolyline) map.setView([latitude, longitude], 15);
     map.panTo([latitude, longitude]);
-
-    if (accuracy > 50) {
-      statusEl.textContent = `⚠️ Low GPS accuracy (${Math.round(accuracy)}m).`;
-      statusEl.className = 'alert';
-    }
-
     if (lastPos && lastTime) {
-      const dist = distanceInMeters(lastPos.latitude, lastPos.longitude, latitude, longitude);
-      const timeDiffSec = (now - lastTime) / 1000;
-      const speedMs = dist / timeDiffSec;
-      const speedKmh = speedMs * 3.6;
-
-      if (!isFinite(speedKmh)) return;
-
+      const dist = distance(lastPos.latitude, lastPos.longitude, latitude, longitude);
+      const timeSec = (now - lastTime) / 1000;
+      const speedKmh = (dist / timeSec) * 3.6;
       speedEl.textContent = speedKmh.toFixed(1);
-
-      if (speedKmh > speedLimit + 2) {
-        statusEl.textContent = '⚠️ Speed limit exceeded!';
-        statusEl.className = 'alert';
-        speak('You are exceeding the speed limit');
-      } else {
-        statusEl.textContent = '✅ Within speed limit.';
-        statusEl.className = 'ok';
-      }
-
-      checkStopsAndSignalsAhead(latitude, longitude);
+      if (speedKmh > speedLimit + 5) speak("You are exceeding the speed limit");
+      checkTurns(); checkAlerts();
     }
-
-    lastPos = { latitude, longitude };
-    lastTime = now;
+    lastPos = { latitude, longitude }; lastTime = now;
   }
 
-  function handleError(err) {
-    statusEl.textContent = 'GPS error: ' + err.message;
-    statusEl.className = 'alert';
+  /* ------------------ TURN ALERTS ------------------ */
+  function checkTurns() {
+    if (!routeSteps.length || nextStepIndex >= routeSteps.length) return;
+    const step = routeSteps[nextStepIndex];
+    const [lon, lat] = step.maneuver.location;
+    const d = distance(currentLat, currentLon, lat, lon);
+    if (d < 200 && !step._alert200) { speak(`In 200 meters, ${step.maneuver.instruction}`); step._alert200 = true; }
+    if (d < 50 && !step._alert50) { speak(step.maneuver.instruction); step._alert50 = true; nextStepIndex++; }
   }
 
-  navigator.geolocation.watchPosition(updateSpeed, handleError, {
-    enableHighAccuracy: true,
-    maximumAge: 0,
-    timeout: 5000
-  });
+  /* ------------------ STOP + SIGNAL ALERTS ------------------ */
+  function checkAlerts() {
+    mapNodes.forEach(node => {
+      if (!isOnRoute(node.lat, node.lon)) return;
+      if (!isIncoming(node.lat, node.lon)) return;
+      const d = distance(currentLat, currentLon, node.lat, node.lon);
+      if (d < 200 && !alerted.has(node.id + "_200")) { speak(node.type + " ahead in 200 meters"); alerted.add(node.id + "_200"); }
+      if (d < 100 && !alerted.has(node.id + "_100")) { speak(node.type + " ahead in 100 meters"); alerted.add(node.id + "_100"); }
+    });
+  }
 
-  async function fetchOSMFeatures(lat, lon) {
-    const radius = 400; // meters
+  /* ------------------ ROUTE BOUNDING BOX ------------------ */
+  function getBoundingBox(coords) {
+    let minLat = 999, maxLat = -999, minLon = 999, maxLon = -999;
+    coords.forEach(c => {
+      const lon = c[0], lat = c[1];
+      if (lat < minLat) minLat = lat;
+      if (lat > maxLat) maxLat = lat;
+      if (lon < minLon) minLon = lon;
+      if (lon > maxLon) maxLon = lon;
+    });
+    const expand = 0.001;
+    return {
+      minLat: minLat - expand,
+      maxLat: maxLat + expand,
+      minLon: minLon - expand,
+      maxLon: maxLon + expand
+    };
+  }
+
+  /* ------------------ FETCH LATEST MAP DATA ------------------ */
+  async function fetchLatestMapData() {
+    if (routeCoords.length === 0) return;
+
+    const box = getBoundingBox(routeCoords);
+
     const query = `
       [out:json];
       (
-        node["highway"="stop"](around:${radius},${lat},${lon});
-        node["highway"="traffic_signals"](around:${radius},${lat},${lon});
-        way["oneway"](around:${radius},${lat},${lon});
+      (
+  node["highway"="stop"](${box.minLat},${box.minLon},${box.maxLat},${box.maxLon});
+  node["highway"="traffic_signals"](${box.minLat},${box.minLon},${box.maxLat},${box.maxLon});
+);
+
+
+
       );
       out body;
-      >;
-      out skel qt;
     `;
 
-    const url = 'https://overpass-api.de/api/interpreter';
-
-    try {
-      const res = await fetch(url, {
-        method: 'POST',
-        body: query
-      });
-      const data = await res.json();
-      processOSMData(data);
-    } catch (e) {
-      console.error(e);
-    }
-  }
-
-  function processOSMData(data) {
-    clearMarkers();
-    onewayWays = [];
-
-    const nodes = {};
-    data.elements.forEach(el => {
-      if (el.type === 'node') {
-        nodes[el.id] = el;
-      }
+    const res = await fetch("https://overpass.kumi.systems/api/interpreter", {
+      method: "POST",
+      body: query
     });
 
+    const data = await res.json();
+
+    nodeLayer.clearLayers();
+    mapNodes = [];
+
     data.elements.forEach(el => {
-      if (el.type === 'node' && el.tags) {
-        if (el.tags.highway === 'stop') {
-          addStopMarker(el.lat, el.lon, el.tags);
+      if (el.type === "node" && el.tags) {
+
+        if (el.tags.highway === "stop") {
+          const type = el.tags.stop === "all" ? "All-way stop" : "Stop";
+          mapNodes.push({ id: el.id, lat: el.lat, lon: el.lon, type });
+
+          const marker = L.marker([el.lat, el.lon], {
+            icon: el.tags.stop === "all" ? allWayIcon : stopIcon,
+            type
+          });
+
+          marker.addTo(nodeLayer);
         }
-        if (el.tags.highway === 'traffic_signals') {
-          addSignalMarker(el.lat, el.lon);
+
+        if (el.tags.highway === "traffic_signals") {
+          mapNodes.push({ id: el.id, lat: el.lat, lon: el.lon, type: "Signal" });
+
+          const marker = L.marker([el.lat, el.lon], {
+            icon: signalIcon,
+            type: "Signal"
+          });
+
+          marker.addTo(nodeLayer);
         }
-      }
-      if (el.type === 'way' && el.tags && el.tags.oneway) {
-        onewayWays.push(el);
       }
     });
   }
 
-  function fakeZoneAndSpeed(lat, lon) {
-    // Simple demo: treat a small area as "school zone"
-    const schoolCenter = { lat: 46.3150, lon: -79.4550 };
-    const dSchool = distanceInMeters(lat, lon, schoolCenter.lat, schoolCenter.lon);
+  /* ------------------ ADDRESS SEARCH ------------------ */
+  async function geocodeAddress(address) {
+    const url = `https://nominatim.openstreetmap.org/search?format=json&countrycodes=ca&addressdetails=1&q=${encodeURIComponent(address)}`;
+    const res = await fetch(url);
+    const data = await res.json();
 
-    if (dSchool < 300) {
-      return { zone: 'school', speedLimit: 40 };
-    }
-    // Else treat as city
-    return { zone: 'city', speedLimit: 50 };
-  }
-
-  function refreshZoneAndOSM() {
-    if (!currentLat || !currentLon) return;
-
-    const zoneData = fakeZoneAndSpeed(currentLat, currentLon);
-    speedLimit = zoneData.speedLimit;
-    limitEl.textContent = speedLimit;
-
-    if (zoneData.zone === 'school') {
-      statusEl.textContent = 'School zone. Drive carefully.';
-      statusEl.className = 'alert';
-      speak('School zone. Drive carefully.');
+    if (data.length === 0) {
+      alert("Address not found in Canada");
+      return null;
     }
 
-    fetchOSMFeatures(currentLat, currentLon);
+    data.forEach(item => {
+      item._dist = distance(currentLat, currentLon, parseFloat(item.lat), parseFloat(item.lon));
+    });
+
+    data.sort((a, b) => a._dist - b._dist);
+
+    const resultsDiv = document.getElementById("results");
+    resultsDiv.innerHTML = "<strong>Select correct address:</strong><br><br>";
+
+    data.forEach(item => {
+      const btn = document.createElement("button");
+      btn.textContent = item.display_name;
+      btn.onclick = () => {
+        resultsDiv.innerHTML = "";
+        startRoute(parseFloat(item.lat), parseFloat(item.lon));
+      };
+      resultsDiv.appendChild(btn);
+    });
+
+    return null;
   }
 
-  setInterval(refreshZoneAndOSM, 5000);
+  /* ------------------ START ROUTE ------------------ */
+  async function startRoute(dLat, dLon) {
+    const url = `https://router.project-osrm.org/route/v1/driving/${currentLon},${currentLat};${dLon},${dLat}?overview=full&geometries=geojson&steps=true`;
+
+    const res = await fetch(url);
+    const data = await res.json();
+
+    const route = data.routes[0];
+    routeCoords = route.geometry.coordinates;
+    routeSteps = route.legs[0].steps;
+    nextStepIndex = 0;
+    alerted.clear();
+
+    if (routePolyline) map.removeLayer(routePolyline);
+    routePolyline = L.polyline(routeCoords.map(c => [c[1], c[0]]), { color: "blue" }).addTo(map);
+
+    speak("Route set. Navigation started.");
+
+    fetchLatestMapData();
+  }
+
+  /* ------------------ SET DESTINATION ------------------ */
+  async function setDestination() {
+    const dest = document.getElementById("destBox").value.trim();
+
+    if (dest.includes(",")) {
+      const [dLat, dLon] = dest.split(",").map(Number);
+      startRoute(dLat, dLon);
+    } else {
+      await geocodeAddress(dest);
+    }
+  }
+
+  /* ------------------ START GPS ------------------ */
+  navigator.geolocation.watchPosition(updateSpeed, err => {
+    statusEl.textContent = "GPS error: " + err.message;
+  }, { enableHighAccuracy: true });
+
+  setInterval(fetchLatestMapData, 10000);
+
 </script>
 
 </body>
